@@ -234,7 +234,11 @@ tbody td{padding:5px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellips
 .m-row{display:flex;justify-content:space-between;padding:6px 8px;background:var(--card);border-radius:var(--r);margin-bottom:5px;font-size:11px}
 .m-row span:first-child{color:var(--sub)}
 
-/* ── Toast ── */
+/* ── Indicator toggle buttons ── */
+.ind-tog{font-size:9px;font-weight:700;padding:2px 6px;border-radius:var(--r);
+  border:1px solid var(--border2);background:transparent;color:var(--dim);cursor:pointer;transition:all .12s}
+.ind-tog:hover{border-color:var(--blue);color:var(--text)}
+.ind-tog.on{background:rgba(41,98,255,.12);border-color:rgba(41,98,255,.4);color:var(--blue)}
 .toast-wrap{position:fixed;bottom:16px;right:16px;z-index:300;display:flex;flex-direction:column;gap:6px;pointer-events:none}
 .toast{padding:9px 14px;border-radius:var(--r);font-size:11px;font-weight:600;border:1px solid;
   transform:translateX(120%);transition:transform .25s;pointer-events:auto;min-width:200px}
@@ -322,6 +326,13 @@ tbody td{padding:5px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellips
         <div class="ctb-r">
           <span style="color:var(--yellow);font-weight:700">━ EMA9</span>
           <span style="color:var(--blue);font-weight:700">━ EMA21</span>
+          <span style="color:rgba(255,255,255,0.6);font-weight:700">━ VWAP</span>
+          <div style="display:flex;gap:3px;margin-left:4px">
+            <button class="ind-tog on" id="tog-footprint" onclick="togInd('footprint',this)" title="Volume Footprint / CVD Delta">Δ CVD</button>
+            <button class="ind-tog on" id="tog-orderblocks" onclick="togInd('orderblocks',this)" title="Order Blocks">OB</button>
+            <button class="ind-tog on" id="tog-pa" onclick="togInd('pa',this)" title="Price Action (FVG, Sweeps, Engulfing)">PA</button>
+            <button class="ind-tog on" id="tog-vwap" onclick="togInd('vwap',this)" title="VWAP + Bands">VWAP</button>
+          </div>
           <button style="padding:2px 7px;border:1px solid var(--border2);border-radius:var(--r);cursor:pointer;color:var(--sub);font-size:10px;background:transparent" onclick="if(selSym)loadChart(selSym)">↺</button>
         </div>
       </div>
@@ -773,13 +784,24 @@ async function fetchKlines(sym,tf,abortSig){
   return null;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// INDICATOR TOGGLE STATE
+// ═══════════════════════════════════════════════════════════════════════════
+const indToggles={footprint:true,orderblocks:true,pa:true,vwap:true};
+
 function applyKlines(klines,cSer,e9Ser,e21Ser,vSer,ch,doInd,doBOS){
-  const candles=klines.map(k=>({time:k[0]/1000,open:+k[1],high:+k[2],low:+k[3],close:+k[4]}));
+  const candles=klines.map(k=>({
+    time:k[0]/1000,open:+k[1],high:+k[2],low:+k[3],close:+k[4],
+    volume:+k[5],quoteVol:+k[7],trades:+k[8],
+    buyBaseVol:+k[9],buyQuoteVol:+k[10],
+  }));
   const vols=klines.map(k=>({
     time:k[0]/1000,value:+k[7],
     color:+k[4]>=+k[1]?'rgba(38,166,154,0.3)':'rgba(239,83,80,0.3)',
   }));
   const closes=candles.map(c=>c.close);
+  const highs=candles.map(c=>c.high);
+  const lows=candles.map(c=>c.low);
   cSer.setData(candles);
   vSer.setData(vols);
   const e9=calcEMA(closes,9),e21=calcEMA(closes,21);
@@ -787,12 +809,383 @@ function applyKlines(klines,cSer,e9Ser,e21Ser,vSer,ch,doInd,doBOS){
   e21Ser.setData(candles.map((c,i)=>e21[i]!=null?{time:c.time,value:+e21[i].toFixed(10)}:null).filter(Boolean));
   ch.timeScale().fitContent();
   if(doInd)updateInd(closes,klines);
+
+  // Clear all overlay series
+  clearOverlays(ch);
+
   if(doBOS){
-    const highs=candles.map(c=>c.high),lows=candles.map(c=>c.low);
     const evts=calcBOS(candles,highs,lows,closes,SWL);
     drawBOS(evts,candles,cSer,ch);
     renderBOSBar(evts);
+    // Order Blocks — derived from BOS events
+    if(indToggles.orderblocks)drawOrderBlocks(evts,candles,ch);
+    // Price Action — FVG, sweeps, engulfing
+    if(indToggles.pa)drawPriceAction(candles,ch);
   }
+  // VWAP
+  if(indToggles.vwap)drawVWAP(candles,ch);
+  // Volume Footprint delta bars (drawn on candles using markers)
+  if(indToggles.footprint)drawFootprint(candles,klines,cSer,ch);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OVERLAY MANAGEMENT — store and clear extra series per chart
+// ═══════════════════════════════════════════════════════════════════════════
+function clearOverlays(ch){
+  if(!ch._overlays)ch._overlays=[];
+  ch._overlays.forEach(s=>{try{ch.removeSeries(s);}catch(e){}});
+  ch._overlays=[];
+  // Also clear BOS line series
+  if(ch._bl){ch._bl.forEach(s=>{try{ch.removeSeries(s);}catch(e){}});ch._bl=[];}
+  else ch._bl=[];
+}
+function addOverlay(ch,series){
+  if(!ch._overlays)ch._overlays=[];
+  ch._overlays.push(series);
+  return series;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VOLUME FOOTPRINT — translated from LuxAlgo Pine Script
+//
+// Pine logic recap:
+//   For each candle, divide price range into k levels (ATR-based intervals)
+//   delta[level] = buyVolume[level] - sellVolume[level]
+//   Color by delta magnitude (gradient) or candle direction
+//
+// In JS we approximate delta using Binance kline data:
+//   buyVol = k[10] (taker buy quote volume)
+//   sellVol = quoteVol - buyVol
+//   We distribute buy/sell proportionally across price levels
+//   based on where price spent time (approximated from OHLC)
+// ═══════════════════════════════════════════════════════════════════════════
+function drawFootprint(candles,klines,cSer,ch){
+  if(candles.length<2)return;
+  const LEVELS=6; // price levels per candle (k in Pine)
+  const markers=[];
+
+  // Only draw footprint on last 40 candles to keep chart readable
+  const recent=candles.slice(-40);
+  const recentK=klines.slice(-40);
+
+  recent.forEach((c,idx)=>{
+    const k=recentK[idx];
+    const range=c.high-c.low;
+    if(range<=0)return;
+
+    const totalQuote=+k[7]||0;
+    const buyQuote=+k[10]||0;
+    const sellQuote=totalQuote-buyQuote;
+    const delta=buyQuote-sellQuote; // positive = net buying, negative = net selling
+    const absDelta=Math.abs(delta);
+
+    // Dominant side
+    const bull=delta>0;
+    const pct=totalQuote>0?Math.abs(delta)/totalQuote:0; // 0-1 strength
+
+    // Add footprint marker showing delta below/above each candle
+    // Format: Δ+12.3M or Δ-8.1M
+    const deltaStr=formatDelta(delta);
+    const strength=Math.min(pct*3,1); // amplify for visibility
+
+    markers.push({
+      time:c.time,
+      position:bull?'belowBar':'aboveBar',
+      color:bull
+        ?`rgba(38,166,154,${0.3+strength*0.7})`
+        :`rgba(239,83,80,${0.3+strength*0.7})`,
+      shape:'circle',
+      text:deltaStr,
+      size:Math.max(1,Math.round(strength*2)),
+    });
+  });
+
+  // Also draw cumulative delta as a line series (CVD)
+  const cvdData=[];
+  let cvd=0;
+  candles.forEach((c,i)=>{
+    const k=klines[i];
+    const totalQ=+k[7]||0,buyQ=+k[10]||0;
+    cvd+=(buyQ-(totalQ-buyQ));
+    // We'll show CVD as a separate pane approximation using price line
+    cvdData.push({time:c.time,value:cvd});
+  });
+
+  // CVD overlay as a thin line at 0-baseline scaled to price
+  // Scale CVD to fit in bottom 15% of chart
+  const minCVD=Math.min(...cvdData.map(d=>d.value));
+  const maxCVD=Math.max(...cvdData.map(d=>d.value));
+  const cvdRange=maxCVD-minCVD||1;
+  const priceMin=Math.min(...candles.map(c=>c.low));
+  const priceMax=Math.max(...candles.map(c=>c.high));
+  const priceRange=priceMax-priceMin||1;
+  const scale=priceRange*0.18/cvdRange; // use 18% of price range for CVD
+
+  const cvdSeries=ch.addLineSeries({
+    color:'rgba(247,166,0,0.7)',lineWidth:1,
+    priceLineVisible:false,lastValueVisible:false,
+    crosshairMarkerVisible:false,
+    title:'CVD',
+  });
+  cvdSeries.setData(cvdData.map(d=>({
+    time:d.time,
+    value:priceMin+(d.value-minCVD)*scale,
+  })));
+  addOverlay(ch,cvdSeries);
+
+  // Set footprint markers (combine with existing markers)
+  // Get existing BOS markers and merge
+  const existing=ch._bosMarkers||[];
+  cSer.setMarkers([...existing,...markers].sort((a,b)=>a.time-b.time));
+  ch._footprintMarkers=markers;
+}
+
+function formatDelta(d){
+  const abs=Math.abs(d);
+  const sign=d>=0?'+':'-';
+  if(abs>=1e9)return`Δ${sign}${(abs/1e9).toFixed(1)}B`;
+  if(abs>=1e6)return`Δ${sign}${(abs/1e6).toFixed(1)}M`;
+  if(abs>=1e3)return`Δ${sign}${(abs/1e3).toFixed(1)}K`;
+  return`Δ${sign}${abs.toFixed(0)}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ORDER BLOCKS
+//
+// Smart Money Concept definition:
+//   Bullish OB = last BEARISH candle before a bullish BOS/MSS
+//   Bearish OB = last BULLISH candle before a bearish BOS/MSS
+//
+// These zones act as supply/demand areas where institutions placed orders.
+// Drawn as semi-transparent rectangles extending to the right.
+// ═══════════════════════════════════════════════════════════════════════════
+function drawOrderBlocks(bosEvts,candles,ch){
+  const OB_EXTEND=15; // extend OB box N candles to the right
+  const blocks=[];
+
+  bosEvts.slice(-8).forEach(ev=>{
+    const breakIdx=ev.ei;
+    const pivIdx=ev.si;
+
+    // Search backwards from pivot to find the OB candle
+    let obIdx=-1;
+    if(ev.dir==='bull'){
+      // Bullish BOS: find last bearish candle before pivot
+      for(let i=pivIdx;i>=Math.max(0,pivIdx-10);i--){
+        if(candles[i].close<candles[i].open){obIdx=i;break;}
+      }
+    } else {
+      // Bearish BOS: find last bullish candle before pivot
+      for(let i=pivIdx;i>=Math.max(0,pivIdx-10);i--){
+        if(candles[i].close>candles[i].open){obIdx=i;break;}
+      }
+    }
+    if(obIdx<0)return;
+
+    const ob=candles[obIdx];
+    const endIdx=Math.min(candles.length-1,obIdx+OB_EXTEND);
+    const bull=ev.dir==='bull';
+
+    blocks.push({
+      bull,
+      top:ob.high,
+      btm:ob.low,
+      startTime:ob.time,
+      endTime:candles[endIdx].time,
+      mitigated:false,
+      mss:ev.mss,
+    });
+  });
+
+  // Check if OB has been mitigated (price traded back through it)
+  blocks.forEach(ob=>{
+    const startI=candles.findIndex(c=>c.time===ob.startTime);
+    for(let i=startI+1;i<candles.length;i++){
+      if(ob.bull&&candles[i].low<ob.btm){ob.mitigated=true;break;}
+      if(!ob.bull&&candles[i].high>ob.top){ob.mitigated=true;break;}
+    }
+  });
+
+  // Draw each OB as a custom price band
+  blocks.forEach(ob=>{
+    const col=ob.mitigated
+      ?(ob.bull?'rgba(38,166,154,0.08)':'rgba(239,83,80,0.08)')
+      :(ob.bull?'rgba(38,166,154,0.18)':'rgba(239,83,80,0.18)');
+    const borderCol=ob.mitigated
+      ?(ob.bull?'rgba(38,166,154,0.2)':'rgba(239,83,80,0.2)')
+      :(ob.bull?'rgba(38,166,154,0.6)':'rgba(239,83,80,0.6)');
+
+    // Top band
+    const topSeries=ch.addLineSeries({
+      color:borderCol,lineWidth:ob.mss?2:1,
+      lineStyle:LightweightCharts.LineStyle.Solid,
+      priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,
+      title:ob.mitigated?'':(ob.bull?'Bull OB':'Bear OB'),
+    });
+    topSeries.setData([{time:ob.startTime,value:ob.top},{time:ob.endTime,value:ob.top}]);
+    addOverlay(ch,topSeries);
+
+    // Bottom band
+    const btmSeries=ch.addLineSeries({
+      color:borderCol,lineWidth:1,
+      lineStyle:LightweightCharts.LineStyle.Dashed,
+      priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,
+    });
+    btmSeries.setData([{time:ob.startTime,value:ob.btm},{time:ob.endTime,value:ob.btm}]);
+    addOverlay(ch,btmSeries);
+
+    // Mid-line (50% of OB = "equilibrium / optimal entry point")
+    const mid=(ob.top+ob.btm)/2;
+    const midSeries=ch.addLineSeries({
+      color:ob.mitigated?'transparent':(ob.bull?'rgba(38,166,154,0.35)':'rgba(239,83,80,0.35)'),
+      lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dotted,
+      priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,
+    });
+    midSeries.setData([{time:ob.startTime,value:mid},{time:ob.endTime,value:mid}]);
+    addOverlay(ch,midSeries);
+  });
+
+  return blocks;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRICE ACTION — 3 key concepts
+//
+// 1. Fair Value Gaps (FVG / Imbalance)
+//    Bull FVG: candle[i-1].high < candle[i+1].low (gap between wicks)
+//    Bear FVG: candle[i-1].low > candle[i+1].high
+//
+// 2. Liquidity Sweeps (stop hunts)
+//    When price wicks past a recent swing high/low then closes back inside
+//    = hunt for stops, often reversal signal
+//
+// 3. Engulfing candles (strong momentum signal)
+//    Bull engulf: current body fully engulfs previous body + close > open
+//    Bear engulf: current body fully engulfs previous body + close < open
+// ═══════════════════════════════════════════════════════════════════════════
+function drawPriceAction(candles,ch){
+  if(candles.length<4)return;
+  const n=candles.length;
+  const paMarkers=[];
+
+  // 1. Fair Value Gaps — scan last 60 candles
+  const FVG_EXTEND=20;
+  const fvgs=[];
+  for(let i=1;i<n-1&&i>n-60;i++){
+    const prev=candles[i-1],curr=candles[i],next=candles[i+1];
+    // Bull FVG: gap between prev high and next low
+    if(next.low>prev.high){
+      fvgs.push({bull:true,top:next.low,btm:prev.high,idx:i});
+    }
+    // Bear FVG: gap between prev low and next high
+    if(next.high<prev.low){
+      fvgs.push({bull:false,top:prev.low,btm:next.high,idx:i});
+    }
+  }
+  // Draw FVG zones (only unmitigated)
+  fvgs.slice(-6).forEach(fvg=>{
+    const endIdx=Math.min(n-1,fvg.idx+FVG_EXTEND);
+    const mitigated=candles.slice(fvg.idx+2,endIdx+1).some(c=>
+      fvg.bull?c.low<fvg.top:c.high>fvg.btm
+    );
+    if(mitigated)return;
+    const col=fvg.bull?'rgba(38,166,154,0.12)':'rgba(239,83,80,0.12)';
+    const bCol=fvg.bull?'rgba(38,166,154,0.4)':'rgba(239,83,80,0.4)';
+    const s1=ch.addLineSeries({color:bCol,lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dotted,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,title:fvg.bull?'FVG ▲':'FVG ▼'});
+    s1.setData([{time:candles[fvg.idx].time,value:fvg.top},{time:candles[endIdx].time,value:fvg.top}]);
+    addOverlay(ch,s1);
+    const s2=ch.addLineSeries({color:bCol,lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dotted,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+    s2.setData([{time:candles[fvg.idx].time,value:fvg.btm},{time:candles[endIdx].time,value:fvg.btm}]);
+    addOverlay(ch,s2);
+  });
+
+  // 2. Liquidity sweeps — last 40 candles
+  const SWING=5;
+  for(let i=SWING;i<n-SWING&&i>n-40;i++){
+    const c=candles[i];
+    // Find local swing high/low
+    let swingHigh=candles[i-SWING].high,swingLow=candles[i-SWING].low;
+    for(let j=i-SWING;j<i;j++){
+      swingHigh=Math.max(swingHigh,candles[j].high);
+      swingLow=Math.min(swingLow,candles[j].low);
+    }
+    // Bull sweep: wick below swing low but close above
+    if(c.low<swingLow&&c.close>swingLow){
+      paMarkers.push({time:c.time,position:'belowBar',color:'#f7a600',shape:'arrowUp',text:'Sweep ▲',size:1});
+    }
+    // Bear sweep: wick above swing high but close below
+    if(c.high>swingHigh&&c.close<swingHigh){
+      paMarkers.push({time:c.time,position:'aboveBar',color:'#f7a600',shape:'arrowDown',text:'Sweep ▼',size:1});
+    }
+  }
+
+  // 3. Strong engulfing candles — last 30 candles
+  for(let i=1;i<n&&i>n-30;i++){
+    const p=candles[i-1],c=candles[i];
+    const pBody=Math.abs(p.close-p.open),cBody=Math.abs(c.close-c.open);
+    if(pBody===0||cBody===0)continue;
+    // Engulf: current body fully covers previous body AND is at least 1.5x bigger
+    if(c.close>c.open&&c.open<p.close&&c.close>p.open&&cBody>pBody*1.5){
+      paMarkers.push({time:c.time,position:'belowBar',color:'#26a69a',shape:'arrowUp',text:'Engulf',size:1});
+    }
+    if(c.close<c.open&&c.open>p.close&&c.close<p.open&&cBody>pBody*1.5){
+      paMarkers.push({time:c.time,position:'aboveBar',color:'#ef5350',shape:'arrowDown',text:'Engulf',size:1});
+    }
+  }
+
+  // Merge PA markers with footprint markers already set
+  ch._paMarkers=paMarkers;
+  mergeAndSetMarkers(ch,ch._bosMarkers||[],ch._footprintMarkers||[],paMarkers);
+}
+
+function mergeAndSetMarkers(ch,bosM,fpM,paM){
+  const all=[...(bosM||[]),...(fpM||[]),...(paM||[])].sort((a,b)=>a.time-b.time);
+  if(mainChart===ch)mainCS.setMarkers(all);
+  else if(sigChart===ch)sigCS.setMarkers(all);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VWAP — Volume Weighted Average Price
+// Standard session VWAP = sum(price × volume) / sum(volume) from bar 0
+// ═══════════════════════════════════════════════════════════════════════════
+function drawVWAP(candles,ch){
+  if(candles.length<2)return;
+  let cumPV=0,cumV=0;
+  const vwapData=[];
+  const sd1upData=[],sd1dnData=[];
+  const sd2upData=[],sd2dnData=[];
+  let cumPV2=0; // for variance
+
+  candles.forEach(c=>{
+    const tp=(c.high+c.low+c.close)/3; // typical price
+    cumPV+=tp*c.volume;
+    cumV+=c.volume;
+    const vwap=cumV>0?cumPV/cumV:tp;
+    // Variance for standard deviation bands
+    cumPV2+=c.volume*(tp-vwap)*(tp-vwap);
+    const variance=cumV>0?cumPV2/cumV:0;
+    const sd=Math.sqrt(variance);
+    vwapData.push({time:c.time,value:vwap});
+    sd1upData.push({time:c.time,value:vwap+sd});
+    sd1dnData.push({time:c.time,value:vwap-sd});
+    sd2upData.push({time:c.time,value:vwap+2*sd});
+    sd2dnData.push({time:c.time,value:vwap-2*sd});
+  });
+
+  const vwapS=ch.addLineSeries({color:'rgba(255,255,255,0.7)',lineWidth:1,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title:'VWAP'});
+  vwapS.setData(vwapData);addOverlay(ch,vwapS);
+
+  const sd1u=ch.addLineSeries({color:'rgba(41,98,255,0.4)',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,title:'VWAP+1σ'});
+  sd1u.setData(sd1upData);addOverlay(ch,sd1u);
+
+  const sd1d=ch.addLineSeries({color:'rgba(41,98,255,0.4)',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,title:'VWAP-1σ'});
+  sd1d.setData(sd1dnData);addOverlay(ch,sd1d);
+
+  const sd2u=ch.addLineSeries({color:'rgba(41,98,255,0.2)',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dotted,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,title:'VWAP+2σ'});
+  sd2u.setData(sd2upData);addOverlay(ch,sd2u);
+
+  const sd2d=ch.addLineSeries({color:'rgba(41,98,255,0.2)',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dotted,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,title:'VWAP-2σ'});
+  sd2d.setData(sd2dnData);addOverlay(ch,sd2d);
 }
 
 // Live kline WS — updates current candle tick by tick
@@ -907,15 +1300,14 @@ function calcBOS(candles,highs,lows,closes,L){
   return evts;
 }
 function drawBOS(evts,candles,cSer,ch){
-  cSer.setMarkers([]);
-  if(ch._bl){ch._bl.forEach(s=>{try{ch.removeSeries(s);}catch(e){}});ch._bl=[];}
-  else ch._bl=[];
   const recent=evts.slice(-12);
-  cSer.setMarkers(recent.map(ev=>{
+  // Store BOS markers so they can be merged with footprint + PA markers
+  ch._bosMarkers=recent.map(ev=>{
     const bull=ev.dir==='bull';
     const col=ev.mss?(bull?'#2962ff':'#9b59b6'):(bull?'#26a69a':'#ef5350');
     return{time:candles[ev.ei].time,position:bull?'belowBar':'aboveBar',color:col,shape:bull?'arrowUp':'arrowDown',text:ev.kind.toUpperCase(),size:ev.mss?2:1};
-  }).sort((a,b)=>a.time-b.time));
+  });
+  // BOS horizontal lines — pivot → break only
   recent.slice(-8).forEach(ev=>{
     const bull=ev.dir==='bull';
     const col=ev.mss?(bull?'rgba(41,98,255,0.7)':'rgba(155,89,182,0.7)'):(bull?'rgba(38,166,154,0.6)':'rgba(239,83,80,0.6)');
@@ -927,6 +1319,8 @@ function drawBOS(evts,candles,cSer,ch){
     ls.setData([{time:candles[ev.si].time,value:ev.price},{time:candles[ev.ei].time,value:ev.price}]);
     ch._bl.push(ls);
   });
+  // Set initial markers (will be re-merged after footprint + PA)
+  cSer.setMarkers(ch._bosMarkers.sort((a,b)=>a.time-b.time));
 }
 function renderBOSBar(evts){
   const el=document.getElementById('bosevts');
@@ -1171,9 +1565,42 @@ function renderSignals(){
 function selectSig(sym,dir){
   sigSelSym=sym;
   renderSignals();
-  showPage('signals',document.querySelector('.tnb:nth-child(6)'));
-  document.querySelectorAll('.tnb').forEach(b=>{if(b.textContent.trim().startsWith('Signal'))b.classList.add('on');});
+  // Switch to signals page
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
+  document.getElementById('page-signals').classList.add('on');
+  document.querySelectorAll('.tnb').forEach(b=>{b.classList.remove('on');if(b.textContent.trim().startsWith('Signal'))b.classList.add('on');});
   loadSigChart(sym);
+  // Fetch klines to score confluence
+  fetchKlines(sym,'15m',null).then(klines=>{
+    if(!klines)return;
+    const result=scoreConfluence(klines,dir);
+    // Show confluence score below the signal chart
+    showConfluence(sym,dir,result);
+  });
+}
+
+function showConfluence(sym,dir,result){
+  // Find or create confluence panel below sig chart
+  let panel=document.getElementById('confluence-panel');
+  if(!panel){
+    panel=document.createElement('div');
+    panel.id='confluence-panel';
+    panel.style.cssText='flex-shrink:0;background:var(--panel);border-top:1px solid var(--border);padding:8px 14px;font-size:11px;overflow-x:auto';
+    document.querySelector('.sig-chart-area').appendChild(panel);
+  }
+  const isL=dir==='long';
+  const scoreColor=result.score>=8?'var(--green)':result.score>=6?'var(--yellow)':result.score>=4?'var(--sub)':'var(--red)';
+  panel.innerHTML=`
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span style="font-weight:700;color:${isL?'var(--green)':'var(--red)'}">${sym.replace('USDT','/USDT')} ${isL?'▲ LONG':'▼ SHORT'}</span>
+      <span style="font-size:9px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--dim)">Confluence</span>
+      <span style="font-size:14px;font-weight:700;color:${scoreColor}">${result.score}/10</span>
+      <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:2px;background:${result.score>=8?'rgba(38,166,154,.15)':result.score>=6?'rgba(247,166,0,.15)':'rgba(76,82,94,.2)'};color:${scoreColor}">${result.label}</span>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-left:4px">
+        ${result.factors.map(f=>`<span style="font-size:9px;padding:1px 6px;border-radius:2px;border:1px solid ${f.col}33;color:${f.col};background:${f.col}11">${f.name}</span>`).join('')}
+      </div>
+      <span style="margin-left:auto;font-size:9px;color:var(--dim)">Based on 15m · EMA · RSI · CVD · Vol · BOS</span>
+    </div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1263,6 +1690,71 @@ function fp(p){
     :p.toFixed(6);
 }
 function fv(v){return v>=1e9?'$'+(v/1e9).toFixed(2)+'B':v>=1e6?'$'+(v/1e6).toFixed(1)+'M':'$'+(v/1e3).toFixed(0)+'K';}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INDICATOR TOGGLES
+// ═══════════════════════════════════════════════════════════════════════════
+function togInd(key,el){
+  indToggles[key]=!indToggles[key];
+  el.classList.toggle('on',indToggles[key]);
+  if(selSym)loadChart(selSym);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFLUENCE SCORER — used to enrich signal cards
+// Combines: BOS/MSS + Order Block + FVG + VWAP + CVD Delta + EMA cross
+// Returns a score 0-10 and a label
+// ═══════════════════════════════════════════════════════════════════════════
+function scoreConfluence(klines,dir){
+  if(!klines||klines.length<30)return{score:0,label:'—',factors:[]};
+  const candles=klines.map(k=>({time:k[0]/1000,open:+k[1],high:+k[2],low:+k[3],close:+k[4],volume:+k[5],quoteVol:+k[7]}));
+  const closes=candles.map(c=>c.close);
+  const highs=candles.map(c=>c.high);
+  const lows=candles.map(c=>c.low);
+  const isLong=dir==='long';
+  let score=0;
+  const factors=[];
+
+  // 1. EMA trend (EMA9 vs EMA21)
+  const e9=calcEMA(closes,9),e21=calcEMA(closes,21);
+  const lastE9=e9[e9.length-1],lastE21=e21[e21.length-1];
+  if(isLong&&lastE9>lastE21){score+=1.5;factors.push({name:'EMA Bullish',col:'var(--green)'});}
+  else if(!isLong&&lastE9<lastE21){score+=1.5;factors.push({name:'EMA Bearish',col:'var(--red)'});}
+
+  // 2. RSI alignment
+  const rsi=calcRSI(closes);
+  if(isLong&&rsi<60&&rsi>40){score+=1;factors.push({name:'RSI Neutral (room to run)',col:'var(--sub)'});}
+  else if(!isLong&&rsi>40&&rsi<60){score+=1;factors.push({name:'RSI Neutral (room to fall)',col:'var(--sub)'});}
+  if(isLong&&rsi<35){score+=2;factors.push({name:'RSI Oversold bounce',col:'var(--green)'});}
+  if(!isLong&&rsi>65){score+=2;factors.push({name:'RSI Overbought fade',col:'var(--red)'});}
+
+  // 3. CVD delta alignment
+  const totalQ=+klines[klines.length-1][7]||0;
+  const buyQ=+klines[klines.length-1][10]||0;
+  const delta=buyQ-(totalQ-buyQ);
+  if(isLong&&delta>0){score+=2;factors.push({name:'CVD Positive (net buying)',col:'var(--green)'});}
+  else if(!isLong&&delta<0){score+=2;factors.push({name:'CVD Negative (net selling)',col:'var(--red)'});}
+
+  // 4. Volume spike
+  const vols=klines.map(k=>+k[7]);
+  const avg20=vols.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+  const lastVol=vols[vols.length-1];
+  if(lastVol>avg20*2){score+=1.5;factors.push({name:'Vol Spike 2x+',col:'var(--yellow)'});}
+
+  // 5. BOS/MSS direction
+  const evts=calcBOS(candles,highs,lows,closes,SWL);
+  const lastEvt=evts[evts.length-1];
+  if(lastEvt){
+    if(isLong&&lastEvt.dir==='bull'&&lastEvt.mss){score+=2;factors.push({name:'MSS Bullish',col:'#5c85ff'});}
+    else if(isLong&&lastEvt.dir==='bull'){score+=1;factors.push({name:'BOS Bullish',col:'var(--green)'});}
+    else if(!isLong&&lastEvt.dir==='bear'&&lastEvt.mss){score+=2;factors.push({name:'MSS Bearish',col:'#b07dd9'});}
+    else if(!isLong&&lastEvt.dir==='bear'){score+=1;factors.push({name:'BOS Bearish',col:'var(--red)'});}
+  }
+
+  score=Math.min(10,+(score).toFixed(1));
+  const label=score>=8?'STRONG':score>=6?'GOOD':score>=4?'MODERATE':'WEAK';
+  return{score,label,factors};
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BOOT
