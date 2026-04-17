@@ -532,11 +532,17 @@ function showPage(name,el){
 function startScanner(){
   if(scannerWS){try{scannerWS.close();}catch(e){}}
 
-  scannerWS=new WebSocket('wss://fstream.binance.com/ws/!ticker@arr');
+  // !miniTicker@arr = lightweight, fast, all pairs — fixes lag vs !ticker@arr
+  scannerWS=new WebSocket('wss://fstream.binance.com/ws/!miniTicker@arr');
 
+  let _heartbeat=null;
   scannerWS.onopen=()=>{
     document.getElementById('dot').classList.add('on');
     document.getElementById('dot').classList.remove('err');
+    // Keep alive through unstable WiFi — ping every 20s
+    _heartbeat=setInterval(()=>{
+      if(scannerWS.readyState===1)try{scannerWS.send(JSON.stringify({method:'LIST_SUBSCRIPTIONS',id:1}));}catch(e){}
+    },20000);
   };
 
   scannerWS.onmessage=(ev)=>{
@@ -551,7 +557,9 @@ function startScanner(){
       // s=symbol, c=lastPrice, P=priceChangePercent, q=quoteVolume(24h), e=event type
       const sym=t.s;
       const price=parseFloat(t.c);
-      const change=parseFloat(t.P);  // already a percentage number like 2.15
+      // miniTicker has no P field — derive % change from open(o) and close(c)
+      const open24=parseFloat(t.o);
+      const change=open24>0?((price-open24)/open24)*100:0;
       const vol24h=parseFloat(t.q);  // 24h quote volume in USDT
 
       // Skip if data is invalid
@@ -601,9 +609,10 @@ function startScanner(){
   };
 
   scannerWS.onclose=()=>{
+    clearInterval(_heartbeat);
     document.getElementById('dot').classList.remove('on');
     document.getElementById('dot').classList.add('err');
-    setTimeout(startScanner,3000); // auto-reconnect
+    setTimeout(startScanner,2000); // faster reconnect (2s not 3s)
   };
   scannerWS.onerror=()=>scannerWS.close();
 }
@@ -1409,19 +1418,49 @@ async function apiCall(action,body=null){
 
 // Load account balance from backend
 async function loadAccount(){
+  const dot=document.getElementById('api-dot');
+  const statusEl=document.getElementById('api-status');
+
+  // Step 1: ping to check if env vars are set
+  try{
+    const ping=await fetch('/api/trade?action=ping');
+    const pdata=await ping.json();
+    if(!pdata.keysConfigured){
+      dot.style.background='var(--yellow)';
+      dot.style.boxShadow='0 0 5px var(--yellow)';
+      statusEl.lastChild.textContent=' API keys not set in Vercel';
+      toast('⚠ Set BINANCE_API_KEY & BINANCE_API_SECRET in Vercel → Settings → Environment Variables','info');
+      return;
+    }
+  }catch(e){
+    // ping failed = likely local dev, skip
+  }
+
+  // Step 2: load real account data
   try{
     const data=await apiCall('account');
     acctBalance=data.balance;
     const badge=document.getElementById('bal-badge');
     badge.textContent='$'+acctBalance.toFixed(2)+' USDT';
     badge.style.display='';
-    document.getElementById('api-dot').style.background='var(--green)';
-    document.getElementById('api-dot').style.boxShadow='0 0 5px var(--green)';
-    document.getElementById('api-status').lastChild.textContent=' API connected';
+    dot.style.background='var(--green)';
+    dot.style.boxShadow='0 0 5px var(--green)';
+    statusEl.lastChild.textContent=' API ready';
     renderPositionsFromAPI(data.positions);
   }catch(e){
-    document.getElementById('api-dot').style.background='var(--red)';
-    document.getElementById('api-status').lastChild.textContent=' API: '+e.message;
+    dot.style.background='var(--red)';
+    dot.style.boxShadow='none';
+    // Show friendly message for common errors
+    const msg=e.message||'';
+    if(msg.includes('not configured')){
+      statusEl.lastChild.textContent=' Keys missing in Vercel';
+      toast('Set BINANCE_API_KEY + BINANCE_API_SECRET in Vercel env vars','err');
+    }else if(msg.includes('-2015')||msg.includes('Invalid API')){
+      statusEl.lastChild.textContent=' Invalid API key';
+      toast('Invalid API key — check your Binance API credentials','err');
+    }else{
+      statusEl.lastChild.textContent=' API: '+msg.slice(0,40);
+    }
   }
 }
 

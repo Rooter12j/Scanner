@@ -1,40 +1,57 @@
 // api/trade.js — Vercel Serverless Function
-// All Binance API calls are made here, server-side.
-// API keys come from Vercel environment variables:
+// Keys set in: Vercel Dashboard → Project → Settings → Environment Variables
 //   BINANCE_API_KEY
 //   BINANCE_API_SECRET
-// Set these in: Vercel Dashboard → Project → Settings → Environment Variables
+//
+// Test your keys work: visit /api/trade?action=ping in browser
 
 const crypto = require('crypto');
 
-function sign(secret, query) {
-  return crypto.createHmac('sha256', secret).update(query).digest('hex');
+function sign(secret, qs) {
+  return crypto.createHmac('sha256', secret).update(qs).digest('hex');
 }
 
 async function binance(endpoint, params = {}, method = 'GET') {
-  const KEY    = process.env.BINANCE_API_KEY;
-  const SECRET = process.env.BINANCE_API_SECRET;
+  const KEY    = process.env.BINANCE_API_KEY    || '';
+  const SECRET = process.env.BINANCE_API_SECRET || '';
 
   if (!KEY || !SECRET) {
-    throw new Error('BINANCE_API_KEY / BINANCE_API_SECRET not set in Vercel env vars');
+    throw new Error('API keys not configured — add BINANCE_API_KEY and BINANCE_API_SECRET in Vercel → Settings → Environment Variables');
   }
 
   params.timestamp  = Date.now();
   params.recvWindow = 5000;
+
   const qs  = new URLSearchParams(params).toString();
   const sig = sign(SECRET, qs);
-  const url = `https://fapi.binance.com${endpoint}?${qs}&signature=${sig}`;
 
-  const res = await fetch(url, {
-    method,
-    headers: { 'X-MBX-APIKEY': KEY },
-  });
-  const data = await res.json();
-  if (data.code && data.code < 0) throw new Error(data.msg || `Binance error ${data.code}`);
+  // For POST: send params in body. For GET: send in URL.
+  let url, fetchOpts;
+  if (method === 'POST') {
+    url = `https://fapi.binance.com${endpoint}`;
+    fetchOpts = {
+      method: 'POST',
+      headers: { 'X-MBX-APIKEY': KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `${qs}&signature=${sig}`,
+    };
+  } else {
+    url = `https://fapi.binance.com${endpoint}?${qs}&signature=${sig}`;
+    fetchOpts = { method: 'GET', headers: { 'X-MBX-APIKEY': KEY } };
+  }
+
+  const res  = await fetch(url, fetchOpts);
+  const text = await res.text();
+
+  let data;
+  try { data = JSON.parse(text); }
+  catch (e) { throw new Error(`Binance returned non-JSON: ${text.slice(0, 100)}`); }
+
+  if (data.code && data.code < 0) throw new Error(`${data.msg} (code ${data.code})`);
   return data;
 }
 
 module.exports = async function handler(req, res) {
+  // CORS — allow browser to call this
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -42,71 +59,98 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const { action } = req.query;
+  const action = req.query.action || '';
+
+  // Helper to parse body (Vercel doesn't always auto-parse)
+  let body = {};
+  if (req.method === 'POST') {
+    try { body = typeof req.body === 'object' ? req.body : JSON.parse(req.body || '{}'); }
+    catch (e) { body = {}; }
+  }
 
   try {
-    // ── GET /api/trade?action=account ─────────────────────────────────────
-    if (req.method === 'GET' && action === 'account') {
-      const data = await binance('/fapi/v2/account', {}, 'GET');
+    // ── PING — health check, no auth needed ───────────────────────────────
+    if (action === 'ping') {
+      const keySet = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET);
       return res.status(200).json({
         ok: true,
-        balance: parseFloat(data.totalWalletBalance || 0),
-        unrealizedPnl: parseFloat(data.totalUnrealizedProfit || 0),
-        positions: (data.positions || [])
-          .filter(p => parseFloat(p.positionAmt) !== 0)
-          .map(p => ({
-            symbol:      p.symbol,
-            side:        parseFloat(p.positionAmt) > 0 ? 'long' : 'short',
-            size:        Math.abs(parseFloat(p.positionAmt)),
-            entryPrice:  parseFloat(p.entryPrice),
-            pnl:         parseFloat(p.unrealizedProfit),
-            leverage:    parseFloat(p.leverage),
-            margin:      parseFloat(p.isolatedMargin || p.initialMargin),
-          })),
+        keysConfigured: keySet,
+        message: keySet
+          ? 'API keys found in env vars ✓'
+          : 'API keys NOT set — go to Vercel → Settings → Environment Variables',
       });
     }
 
-    // ── POST /api/trade?action=order ──────────────────────────────────────
-    if (req.method === 'POST' && action === 'order') {
+    // ── ACCOUNT ───────────────────────────────────────────────────────────
+    if (action === 'account') {
+      const data = await binance('/fapi/v2/account', {}, 'GET');
+      const positions = (data.positions || [])
+        .filter(p => parseFloat(p.positionAmt) !== 0)
+        .map(p => ({
+          symbol:     p.symbol,
+          side:       parseFloat(p.positionAmt) > 0 ? 'long' : 'short',
+          size:       Math.abs(parseFloat(p.positionAmt)),
+          entryPrice: parseFloat(p.entryPrice),
+          pnl:        parseFloat(p.unrealizedProfit),
+          leverage:   parseFloat(p.leverage),
+        }));
+      return res.status(200).json({
+        ok: true,
+        balance:       parseFloat(data.totalWalletBalance   || 0),
+        unrealizedPnl: parseFloat(data.totalUnrealizedProfit || 0),
+        positions,
+      });
+    }
+
+    // ── PLACE ORDER ───────────────────────────────────────────────────────
+    if (action === 'order') {
+      if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'POST required for orders' });
       const { symbol, side, type, quantity, price, stopPrice,
-              leverage, marginType, takeProfitPrice, stopLossPrice } = req.body;
+              leverage, marginType, takeProfitPrice, stopLossPrice } = body;
 
       if (!symbol || !side || !quantity) {
-        return res.status(400).json({ ok: false, error: 'Missing required fields' });
+        return res.status(400).json({ ok: false, error: 'Missing: symbol, side, quantity' });
       }
 
       // 1. Set leverage
-      try {
-        await binance('/fapi/v1/leverage', { symbol, leverage: leverage || 10 });
-      } catch (e) { /* already set */ }
+      try { await binance('/fapi/v1/leverage', { symbol, leverage: leverage || 10 }, 'POST'); }
+      catch (e) { /* already set — non-fatal */ }
 
       // 2. Set margin type
-      try {
-        await binance('/fapi/v1/marginType', { symbol, marginType: (marginType || 'CROSS').toUpperCase() });
-      } catch (e) { /* already set */ }
+      try { await binance('/fapi/v1/marginType', { symbol, marginType: (marginType || 'CROSS').toUpperCase() }, 'POST'); }
+      catch (e) { /* already set — non-fatal */ }
 
-      // 3. Place main order
-      const orderParams = { symbol, side: side.toUpperCase(), type: (type || 'MARKET').toUpperCase(), quantity };
-      if (type === 'LIMIT')  { orderParams.price = price; orderParams.timeInForce = 'GTC'; }
-      if (type === 'STOP')   { orderParams.stopPrice = stopPrice; }
+      // 3. Main order
+      const orderParams = {
+        symbol,
+        side:     side.toUpperCase(),
+        type:     (type || 'MARKET').toUpperCase(),
+        quantity: String(quantity),
+      };
+      if (type === 'LIMIT')  { orderParams.price = String(price); orderParams.timeInForce = 'GTC'; }
+      if (type === 'STOP')   { orderParams.stopPrice = String(stopPrice); }
 
       const order = await binance('/fapi/v1/order', orderParams, 'POST');
 
-      // 4. TP/SL orders
+      // 4. TP/SL
       const closeSide = side.toUpperCase() === 'BUY' ? 'SELL' : 'BUY';
       if (takeProfitPrice) {
         try {
           await binance('/fapi/v1/order', {
-            symbol, side: closeSide, type: 'TAKE_PROFIT_MARKET',
-            stopPrice: takeProfitPrice, closePosition: 'true',
+            symbol, side: closeSide,
+            type: 'TAKE_PROFIT_MARKET',
+            stopPrice: String(takeProfitPrice),
+            closePosition: 'true',
           }, 'POST');
         } catch (e) {}
       }
       if (stopLossPrice) {
         try {
           await binance('/fapi/v1/order', {
-            symbol, side: closeSide, type: 'STOP_MARKET',
-            stopPrice: stopLossPrice, closePosition: 'true',
+            symbol, side: closeSide,
+            type: 'STOP_MARKET',
+            stopPrice: String(stopLossPrice),
+            closePosition: 'true',
           }, 'POST');
         } catch (e) {}
       }
@@ -114,20 +158,24 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true, orderId: order.orderId, order });
     }
 
-    // ── POST /api/trade?action=close ──────────────────────────────────────
-    if (req.method === 'POST' && action === 'close') {
-      const { symbol, side, quantity } = req.body;
+    // ── CLOSE POSITION ────────────────────────────────────────────────────
+    if (action === 'close') {
+      if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'POST required' });
+      const { symbol, side, quantity } = body;
       const order = await binance('/fapi/v1/order', {
-        symbol, side: side.toUpperCase(), type: 'MARKET',
-        quantity, reduceOnly: 'true',
+        symbol,
+        side:       side.toUpperCase(),
+        type:       'MARKET',
+        quantity:   String(quantity),
+        reduceOnly: 'true',
       }, 'POST');
       return res.status(200).json({ ok: true, orderId: order.orderId });
     }
 
-    return res.status(400).json({ ok: false, error: 'Unknown action: ' + action });
+    return res.status(400).json({ ok: false, error: `Unknown action: "${action}". Valid: ping, account, order, close` });
 
   } catch (e) {
-    console.error('[trade.js]', e.message);
+    console.error('[trade.js]', action, e.message);
     return res.status(500).json({ ok: false, error: e.message });
   }
 };
