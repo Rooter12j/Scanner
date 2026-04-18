@@ -1439,25 +1439,58 @@ async function loadAccount(){
   // Step 2: load real account data
   try{
     const data=await apiCall('account');
-    acctBalance=data.balance;
+
+    // Pick the best non-zero balance from all fields returned
+    const candidates=[
+      data.balance,
+      data.futuresWallet,
+      data.availBalance,
+      data.marginBalance,
+    ].map(v=>parseFloat(v)||0);
+    acctBalance=Math.max(...candidates);
+
     const badge=document.getElementById('bal-badge');
-    badge.textContent='$'+acctBalance.toFixed(2)+' USDT';
-    badge.style.display='';
-    dot.style.background='var(--green)';
-    dot.style.boxShadow='0 0 5px var(--green)';
-    statusEl.lastChild.textContent=' API ready';
+
+    if(acctBalance>0){
+      badge.textContent='$'+acctBalance.toFixed(2)+' USDT';
+      badge.style.display='';
+      dot.style.background='var(--green)';
+      dot.style.boxShadow='0 0 5px var(--green)';
+      statusEl.lastChild.textContent=' API ready';
+    } else {
+      // Futures wallet is empty — check if funds are in spot
+      const spotBal=parseFloat(data.spotUSDT)||0;
+      if(spotBal>0){
+        badge.textContent='Spot: $'+spotBal.toFixed(2)+' USDT (not in Futures)';
+        badge.style.display='';
+        badge.style.color='var(--yellow)';
+        badge.style.borderColor='rgba(247,166,0,.4)';
+        badge.style.background='rgba(247,166,0,.08)';
+        dot.style.background='var(--yellow)';
+        dot.style.boxShadow='0 0 5px var(--yellow)';
+        statusEl.lastChild.textContent=' API ready';
+        toast('⚠ Your USDT is in the Spot wallet. Transfer to Futures wallet on Binance to trade.','info');
+      } else {
+        // Genuinely zero balance
+        badge.textContent='$0.00 USDT';
+        badge.style.display='';
+        dot.style.background='var(--green)';
+        dot.style.boxShadow='0 0 5px var(--green)';
+        statusEl.lastChild.textContent=' API ready (empty)';
+      }
+    }
+
     renderPositionsFromAPI(data.positions);
   }catch(e){
     dot.style.background='var(--red)';
     dot.style.boxShadow='none';
-    // Show friendly message for common errors
     const msg=e.message||'';
-    if(msg.includes('not configured')){
+    if(msg.includes('not configured')||msg.includes('KEYS_NOT_SET')){
       statusEl.lastChild.textContent=' Keys missing in Vercel';
       toast('Set BINANCE_API_KEY + BINANCE_API_SECRET in Vercel env vars','err');
-    }else if(msg.includes('-2015')||msg.includes('Invalid API')){
+    }else if(msg.includes('Invalid API')||msg.includes('-2015')){
       statusEl.lastChild.textContent=' Invalid API key';
-      toast('Invalid API key — check your Binance API credentials','err');
+      toast('Invalid API key — check your Binance credentials','err');
     }else{
       statusEl.lastChild.textContent=' API: '+msg.slice(0,40);
     }
